@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Study Flow - Quản Lý Thời Gian</title>
+    <!-- Tải Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Tải React và Babel để chạy JSX trực tiếp -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tải thư viện Lucide Icons (Nó sẽ tự động đặt các icons vào window.lucide) -->
+    <script src="https://unpkg.com/lucide-react@0.292.0/dist/lucide-react.min.js"></script>
+
+    <!-- Tải Firebase (Sử dụng module import an toàn và gán vào window) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, addDoc, onSnapshot, serverTimestamp, updateDoc, doc, deleteDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Gán các hàm Firebase vào window để script type="text/babel" có thể truy cập
+        window.firebaseDependencies = {
+            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+            getFirestore, collection, query, orderBy, addDoc, onSnapshot, serverTimestamp, updateDoc, doc, deleteDoc, getDoc
+        };
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            overflow: hidden; /* Ngăn cuộn body, chỉ cho phép main cuộn */
+        }
+        /* Style cho Notification Box */
+        #notification-box {
+            min-width: 300px;
+            text-align: center;
+            opacity: 0;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="root"></div>
+
+<script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+    const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, query, orderBy, addDoc, onSnapshot, serverTimestamp, updateDoc, doc, deleteDoc } = window.firebaseDependencies;
+    
+    // Hàm hiển thị thông báo thay cho alert/confirm
+    const showNotification = (message, type = 'info') => {
+        const notificationBox = document.getElementById('notification-box');
+        if (!notificationBox) return;
+
+        let bgColor = 'bg-blue-500';
+        if (type === 'error') bgColor = 'bg-red-500';
+        if (type === 'success') bgColor = 'bg-green-500';
+        if (type === 'warning') bgColor = 'bg-orange-500';
+
+        notificationBox.textContent = message;
+        notificationBox.className = `p-3 rounded-lg text-white font-bold fixed bottom-4 left-1/2 transform -translate-x-1/2 z-50 transition-opacity duration-300 ${bgColor}`;
+        notificationBox.style.opacity = 1;
+        
+        setTimeout(() => {
+            notificationBox.style.opacity = 0;
+        }, 5000);
+    };
+
+    // Tạo component proxy cho Lucide Icons
+    const LucideIcon = ({ name, size = 24, className = '', fill = 'none' }) => {
+        // Đảm bảo window.lucide đã được tải
+        const IconComponent = window.lucide && window.lucide[name]; 
+        if (!IconComponent) return null;
+        
+        // Tạo một component wrapper đơn giản cho icon
+        return React.createElement(IconComponent, { size, className, fill });
+    };
+
+    // --- CẤU HÌNH FIREBASE (Dành cho bản triển khai ngoài Canvas) ---
+    // HƯỚNG DẪN: ĐỔI THÀNH CẤU HÌNH FIREBASE CỦA BẠN ĐỂ CÓ LƯU TRỮ BỀN VỮNG
+    // Nếu bạn muốn lưu trữ dữ liệu, hãy thay thế nội dung trong firebaseConfig
+    const firebaseConfig = {
+      // Ví dụ: apiKey: "...", authDomain: "...", projectId: "...",
+    };
+    
+    // Sử dụng giá trị mặc định cho triển khai bên ngoài Canvas
+    const appId = 'study-flow-v1'; 
+    const initialAuthToken = ''; 
+    const COLLECTION_PATH = `/artifacts/${appId}/users/`;
+
+    // Cấu hình Pomodoro mặc định
+    const POMODORO_WORK_MINUTES = 25;
+    const POMODORO_BREAK_MINUTES = 5;
+
+    /**
+     * Hàm tính điểm ưu tiên (Urgency Score)
+     * Điểm càng cao, công việc càng cần làm ngay
+     */
+    const calculateUrgencyScore = (task) => {
+        if (task.isCompleted) return -1;
+
+        const today = Date.now();
+        const deadline = new Date(task.deadline).getTime();
+        const diffDays = (deadline - today) / (1000 * 60 * 60 * 24);
+
+        let score = 0;
+
+        // 1. Điểm theo độ quan trọng (Importance Score)
+        const priorityMap = { 'A': 3, 'B': 2, 'C': 1 };
+        score += priorityMap[task.priority] * 5; // Điểm nền tảng
+
+        // 2. Điểm theo thời hạn (Deadline Score)
+        if (diffDays <= 0) {
+            score += 50; // Quá hạn (Overdue)
+        } else if (diffDays <= 1) {
+            score += 30; // Rất gấp (Dưới 24h)
+        } else if (diffDays <= 3) {
+            score += 15; // Gấp (Dưới 3 ngày)
+        } else if (diffDays <= 7) {
+            score += 5;  // Cần chú ý (Dưới 1 tuần)
+        }
+
+        return score;
+    };
+
+    /**
+     * Hàm chính của ứng dụng - Smart Study Flow
+     */
+    const App = () => {
+        const [db, setDb] = useState(null);
+        const [auth, setAuth] = useState(null);
+        const [userId, setUserId] = useState(null);
+        const [isAuthReady, setIsAuthReady] = useState(false);
+        const [tasks, setTasks] = useState([]);
+        const [showForm, setShowForm] = useState(false);
+        const [filter, setFilter] = useState('active'); // active, completed, all
+
+        // State Pomodoro
+        // { taskId, taskName, isWorking: true/false, timeRemaining: seconds, status: 'running'|'paused' }
+        const [activePomodoro, setActivePomodoro] = useState(null);
+        const [timerId, setTimerId] = useState(null); 
+
+        // State cho Form thêm/sửa task
+        const [taskInput, setTaskInput] = useState({
+            id: null,
+            name: '',
+            priority: 'B',
+            deadline: '',
+            estimatedTime: '60', // Đơn vị phút
+        });
+
+        // 1. Khởi tạo Firebase và Xác thực (Auth)
+        useEffect(() => {
+            // Kiểm tra xem dependencies Firebase đã được tải chưa
+            if (!window.firebaseDependencies) {
+                 showNotification("Lỗi: Các thư viện Firebase chưa được tải. Ứng dụng sẽ chạy ở chế độ tạm thời.", 'error');
+                 setUserId(crypto.randomUUID());
+                 setIsAuthReady(true);
+                 return;
+            }
+
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.warn("Firebase chưa được cấu hình. Dữ liệu sẽ không được lưu trữ bền vững.");
+                    // Thiết lập user ID ngẫu nhiên khi không có config Firebase
+                    setUserId(crypto.randomUUID());
+                    setIsAuthReady(true);
+                    return;
+                }
+                
+                const app = initializeApp(firebaseConfig);
+                const firestore = getFirestore(app);
+                const authentication = getAuth(app);
+                
+                setDb(firestore);
+                setAuth(authentication);
+
+                const unsubscribe = onAuthStateChanged(authentication, (user) => {
+                    if (user) {
+                        setUserId(user.uid);
+                    } else {
+                        if (initialAuthToken) {
+                            signInWithCustomToken(authentication, initialAuthToken)
+                                .catch(error => { console.error("Lỗi đăng nhập custom token:", error); signInAnonymously(authentication); });
+                        } else {
+                            signInAnonymously(authentication);
+                        }
+                    }
+                    setIsAuthReady(true);
+                });
+
+                return () => unsubscribe();
+            } catch (e) {
+                console.error("Lỗi khởi tạo Firebase:", e);
+                // Dùng ID ngẫu nhiên nếu Firebase lỗi
+                setUserId(crypto.randomUUID());
+                setIsAuthReady(true);
+            }
+        }, []);
+
+        // 2. Lắng nghe Tasks từ Firestore
+        useEffect(() => {
+            if (!db || !userId) {
+                // Nếu không có DB, khởi tạo tasks rỗng
+                if (isAuthReady && !db) setTasks([]); 
+                return;
+            }
+
+            const userTaskCollectionPath = `${COLLECTION_PATH}${userId}/tasks`;
+            const tasksRef = collection(db, userTaskCollectionPath);
+            
+            // Truy vấn: sắp xếp theo thời gian tạo, để dễ theo dõi
+            const q = query(tasksRef, orderBy('createdAt', 'asc')); 
+
+            const unsubscribe = onSnapshot(q, (snapshot) => {
+                const fetchedTasks = snapshot.docs.map(doc => {
+                    const data = doc.data();
+                    return {
+                        id: doc.id,
+                        ...data,
+                        // Xử lý chuyển đổi Date từ Firestore Timestamp
+                        deadline: data.deadline?.toDate ? data.deadline.toDate().toISOString().substring(0, 10) : data.deadline || '',
+                        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : null
+                    };
+                });
+                setTasks(fetchedTasks);
+            }, (error) => {
+                console.error("Lỗi lắng nghe tasks Firestore:", error);
+                showNotification("Lỗi tải dữ liệu từ Firestore. Vui lòng kiểm tra kết nối.", 'error');
+            });
+
+            return () => unsubscribe();
+        }, [db, userId, isAuthReady]);
+
+
+        // 3. Logic Bộ đếm Pomodoro (Timer Logic)
+        useEffect(() => {
+            if (activePomodoro && activePomodoro.timeRemaining > 0 && activePomodoro.status === 'running') {
+                if (timerId) clearInterval(timerId);
+
+                const newTimerId = setInterval(() => {
+                    setActivePomodoro(prev => {
+                        if (!prev || prev.timeRemaining <= 1) {
+                            clearInterval(newTimerId);
+                            
+                            const nextIsWorking = !prev.isWorking;
+                            const nextTime = nextIsWorking ? POMODORO_WORK_MINUTES * 60 : POMODORO_BREAK_MINUTES * 60;
+
+                            const messageType = nextIsWorking ? "Bắt đầu làm việc" : "Bắt đầu nghỉ giải lao";
+                            
+                            // Sử dụng thông báo trực quan
+                            showNotification(`🔔 Hết giờ! ${messageType}: ${prev.taskName}`, nextIsWorking ? 'info' : 'success');
+
+                            return { 
+                                ...prev, 
+                                isWorking: nextIsWorking, 
+                                timeRemaining: nextTime,
+                                status: 'running' // Tự động chạy chu kỳ tiếp theo
+                            };
+                        }
+                        return { ...prev, timeRemaining: prev.timeRemaining - 1 };
+                    });
+                }, 1000);
+                
+                setTimerId(newTimerId);
+                return () => clearInterval(newTimerId);
+            } else if (activePomodoro && activePomodoro.status === 'paused' && timerId) {
+                clearInterval(timerId);
+                setTimerId(null);
+            }
+        }, [activePomodoro?.taskId, activePomodoro?.isWorking, activePomodoro?.timeRemaining, activePomodoro?.status, timerId]);
+
+
+        // --- HÀM ĐIỀU KHIỂN POMODORO ---
+
+        const startPomodoro = (task) => {
+            if (activePomodoro && activePomodoro.taskId !== task.id) {
+                showNotification("Vui lòng dừng Pomodoro hiện tại trước khi bắt đầu cái mới.", 'warning');
+                return;
+            }
+
+            if (activePomodoro?.taskId === task.id) {
+                // Tiếp tục/Bắt đầu lại
+                setActivePomodoro(prev => ({ 
+                    ...prev, 
+                    status: 'running',
+                    timeRemaining: prev.timeRemaining || (POMODORO_WORK_MINUTES * 60) 
+                }));
+            } else {
+                // Bắt đầu mới
+                setActivePomodoro({
+                    taskId: task.id,
+                    taskName: task.name,
+                    isWorking: true,
+                    timeRemaining: POMODORO_WORK_MINUTES * 60,
+                    status: 'running'
+                });
+            }
+        };
+
+        const pausePomodoro = () => {
+            if (timerId) {
+                setActivePomodoro(prev => ({ ...prev, status: 'paused' }));
+            }
+        };
+
+        const resetPomodoro = () => {
+            if (timerId) clearInterval(timerId);
+            setTimerId(null);
+            setActivePomodoro({
+                taskId: activePomodoro.taskId,
+                taskName: activePomodoro.taskName,
+                isWorking: true,
+                timeRemaining: POMODORO_WORK_MINUTES * 60,
+                status: 'paused'
+            });
+            showNotification(`Đã thiết lập lại Pomodoro cho công việc: ${activePomodoro.taskName}`, 'info');
+        };
+        
+        // --- HÀM XỬ LÝ TASK ---
+
+        const handleFormSubmit = async (e) => {
+            e.preventDefault();
+            if (!taskInput.name.trim() || !taskInput.deadline) {
+                showNotification("Vui lòng nhập tên công việc và hạn chót.", 'warning');
+                return;
+            }
+
+            try {
+                const taskData = {
+                    name: taskInput.name.trim(),
+                    priority: taskInput.priority,
+                    deadline: new Date(taskInput.deadline),
+                    estimatedTime: parseInt(taskInput.estimatedTime, 10),
+                    isCompleted: false,
+                };
+
+                // Nếu có DB, lưu lên DB. Nếu không, chỉ lưu vào state (không bền vững)
+                if (db && userId) {
+                     const userTaskCollectionPath = `${COLLECTION_PATH}${userId}/tasks`;
+                    if (taskInput.id) {
+                        await updateDoc(doc(db, userTaskCollectionPath, taskInput.id), taskData);
+                        showNotification("Cập nhật công việc thành công!", 'success');
+                    } else {
+                        await addDoc(collection(db, userTaskCollectionPath), {
+                            ...taskData,
+                            createdAt: serverTimestamp(),
+                        });
+                        showNotification("Thêm công việc thành công!", 'success');
+                    }
+                } else {
+                    // Xử lý mock data cho trường hợp không có Firebase
+                    showNotification("Firebase chưa được cấu hình. Task được thêm tạm thời.", 'warning');
+                    setTasks(prevTasks => {
+                        const newId = crypto.randomUUID();
+                        if (taskInput.id) {
+                            return prevTasks.map(t => t.id === taskInput.id ? {...t, ...taskData} : t);
+                        } else {
+                            return [...prevTasks, {...taskData, id: newId, createdAt: new Date()}];
+                        }
+                    });
+                }
+                resetForm();
+            } catch (error) {
+                console.error("Lỗi thêm/cập nhật task:", error);
+                showNotification("Lỗi khi thêm/cập nhật công việc.", 'error');
+            }
+        };
+
+        const toggleTaskCompleted = async (taskId, currentStatus) => {
+            if (!db || !userId) {
+                 showNotification("Firebase chưa được cấu hình. Trạng thái chỉ thay đổi tạm thời.", 'warning');
+                 setTasks(prevTasks => prevTasks.map(t => t.id === taskId ? {...t, isCompleted: !currentStatus} : t));
+                 return;
+            }
+            const userTaskCollectionPath = `${COLLECTION_PATH}${userId}/tasks`;
+            
+            if (activePomodoro && activePomodoro.taskId === taskId) {
+                if (timerId) clearInterval(timerId);
+                setTimerId(null);
+                setActivePomodoro(null);
+                showNotification("Đã dừng Pomodoro đang chạy.", 'info');
+            }
+
+            try {
+                await updateDoc(doc(db, userTaskCollectionPath, taskId), {
+                    isCompleted: !currentStatus,
+                    completedAt: !currentStatus ? serverTimestamp() : null,
+                });
+                showNotification(`Đã đánh dấu là ${!currentStatus ? 'Hoàn thành' : 'Chưa hoàn thành'}`, 'success');
+            } catch (error) {
+                console.error("Lỗi cập nhật trạng thái task:", error);
+                showNotification("Lỗi cập nhật trạng thái công việc.", 'error');
+            }
+        };
+
+        const deleteTask = async (taskId) => {
+            const isConfirmed = window.confirm("Bạn có chắc chắn muốn xóa công việc này không? Hành động này không thể hoàn tác.");
+            if (!isConfirmed) return;
+            
+            if (activePomodoro && activePomodoro.taskId === taskId) {
+                if (timerId) clearInterval(timerId);
+                setTimerId(null);
+                setActivePomodoro(null);
+            }
+
+            if (!db || !userId) {
+                 showNotification("Firebase chưa được cấu hình. Task chỉ bị xóa tạm thời.", 'warning');
+                 setTasks(prevTasks => prevTasks.filter(t => t.id !== taskId));
+                 return;
+            }
+            const userTaskCollectionPath = `${COLLECTION_PATH}${userId}/tasks`;
+            try {
+                await deleteDoc(doc(db, userTaskCollectionPath, taskId));
+                showNotification("Đã xóa công việc thành công.", 'info');
+            } catch (error) {
+                console.error("Lỗi xóa task:", error);
+                showNotification("Lỗi khi xóa công việc.", 'error');
+            }
+        };
+
+        const editTask = (task) => {
+            setTaskInput({
+                id: task.id,
+                name: task.name,
+                priority: task.priority,
+                deadline: task.deadline,
+                estimatedTime: String(task.estimatedTime),
+            });
+            setShowForm(true);
+        };
+
+        const resetForm = () => {
+            setTaskInput({
+                id: null,
+                name: '',
+                priority: 'B',
+                deadline: '',
+                estimatedTime: '60',
+            });
+            setShowForm(false);
+        };
+
+        // --- XỬ LÝ HIỂN THỊ VÀ SẮP XẾP ---
+
+        const getPriorityStyle = (priority) => {
+            switch (priority) {
+                case 'A': return 'text-red-600 bg-red-100 dark:bg-red-900 dark:text-red-300';
+                case 'B': return 'text-yellow-600 bg-yellow-100 dark:bg-yellow-900 dark:text-yellow-300';
+                case 'C': return 'text-green-600 bg-green-100 dark:bg-green-900 dark:text-green-300';
+                default: return 'text-gray-600 bg-gray-100 dark:bg-gray-700 dark:text-gray-300';
+            }
+        };
+
+        const filteredAndSortedTasks = useMemo(() => {
+            let filtered = tasks;
+
+            if (filter === 'active') {
+                filtered = tasks.filter(t => !t.isCompleted);
+            } else if (filter === 'completed') {
+                filtered = tasks.filter(t => t.isCompleted);
+            }
+
+            return filtered.sort((a, b) => {
+                const scoreA = calculateUrgencyScore(a);
+                const scoreB = calculateUrgencyScore(b);
+                
+                if (scoreA !== scoreB) {
+                    return scoreB - scoreA;
+                }
+                
+                if (new Date(a.deadline).getTime() !== new Date(b.deadline).getTime()) {
+                    return new Date(a.deadline).getTime() - new Date(b.deadline).getTime();
+                }
+                
+                return a.createdAt?.getTime() - b.createdAt?.getTime();
+            });
+        }, [tasks, filter]);
+
+        const totalCompletedTime = tasks
+            .filter(t => t.isCompleted)
+            .reduce((sum, t) => sum + (t.estimatedTime || 0), 0);
+
+        const formatTime = (minutes) => {
+            const h = Math.floor(minutes / 60);
+            const m = minutes % 60;
+            return `${h} giờ ${m} phút`;
+        };
+
+        const formatSecondsToMinutesAndSeconds = (totalSeconds) => {
+            const minutes = Math.floor(totalSeconds / 60);
+            const seconds = totalSeconds % 60;
+            return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        };
+
+
+        // --- UI COMPONENT: TASK CARD ---
+
+        const TaskCard = ({ task }) => {
+            const urgencyScore = calculateUrgencyScore(task);
+            const isOverdue = urgencyScore >= 50 && !task.isCompleted;
+            const deadlineDate = task.deadline ? new Date(task.deadline).toLocaleDateString('vi-VN') : 'N/A';
+            
+            const isPomodoroActive = activePomodoro && activePomodoro.taskId === task.id;
+            const isPomodoroRunning = isPomodoroActive && activePomodoro.status === 'running';
+
+            let barColor = 'bg-gray-300';
+            if (urgencyScore > 50) barColor = 'bg-red-600';
+            else if (urgencyScore > 30) barColor = 'bg-orange-500';
+            else if (urgencyScore > 10) barColor = 'bg-indigo-400';
+            else if (urgencyScore > 0) barColor = 'bg-blue-400';
+            if (task.isCompleted) barColor = 'bg-green-500';
+
+            const pomodoroTime = isPomodoroActive 
+                ? formatSecondsToMinutesAndSeconds(activePomodoro.timeRemaining) 
+                : formatSecondsToMinutesAndSeconds(POMODORO_WORK_MINUTES * 60);
+            
+            const pomodoroLabel = isPomodoroActive 
+                ? (activePomodoro.isWorking ? 'Làm việc' : 'Nghỉ giải lao')
+                : 'Sẵn sàng';
+
+            return (
+                <div className={`p-4 rounded-xl shadow-lg border-l-4 transition-all duration-300 ${task.isCompleted ? 'bg-green-50 dark:bg-gray-700 border-green-500 opacity-70' : 'bg-white dark:bg-gray-800 border-indigo-500'}`}>
+                    
+                    {/* Thanh ưu tiên (Urgency Bar) */}
+                    <div className={`h-1 rounded-full w-full mb-3 ${barColor} transition-all`}></div>
+
+                    <div className="flex justify-between items-start flex-wrap">
+                        <div className="flex-1 min-w-0 pr-4">
+                            <h3 className={`text-lg font-semibold truncate ${task.isCompleted ? 'line-through text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-white'}`}>
+                                {task.name}
+                            </h3>
+                            <div className="flex flex-wrap items-center mt-2 space-x-3 text-sm text-gray-600 dark:text-gray-400">
+                                
+                                <span className={`px-2 py-0.5 rounded-full font-medium ${getPriorityStyle(task.priority)}`}>
+                                    Quan trọng: {task.priority}
+                                </span>
+                                
+                                <span className="flex items-center">
+                                    <LucideIcon name="Clock" size={14} className="mr-1 text-indigo-400" />
+                                    Ước tính: {formatTime(task.estimatedTime)}
+                                </span>
+                                
+                                <span className="flex items-center">
+                                    <LucideIcon name="Calendar" size={14} className="mr-1 text-yellow-500" />
+                                    Hạn chót: {deadlineDate}
+                                </span>
+                                
+                                {isOverdue && (
+                                    <span className="flex items-center text-red-600 font-bold ml-3 animate-pulse">
+                                        <LucideIcon name="AlertTriangle" size={14} className="mr-1" />
+                                        QUÁ HẠN!
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* Bộ điều khiển Pomodoro */}
+                        {!task.isCompleted && (
+                            <div className={`mt-3 md:mt-0 p-2 border rounded-xl flex items-center justify-center space-x-2 ${isPomodoroActive ? (activePomodoro.isWorking ? 'border-indigo-500 bg-indigo-50 dark:bg-gray-700' : 'border-green-500 bg-green-50 dark:bg-gray-700') : 'border-gray-300 dark:border-gray-700'}`}>
+                                <span className={`font-mono text-xl font-bold ${isPomodoroActive ? (activePomodoro.isWorking ? 'text-indigo-600' : 'text-green-600') : 'text-gray-500 dark:text-gray-300'}`}>
+                                    {pomodoroTime}
+                                </span>
+                                
+                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${isPomodoroActive ? (activePomodoro.isWorking ? 'bg-indigo-200 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-300' : 'bg-green-200 text-green-800 dark:bg-green-900 dark:text-green-300') : 'bg-gray-200 dark:bg-gray-600 text-gray-600 dark:text-gray-300'}`}>
+                                    {pomodoroLabel}
+                                </span>
+                                
+                                {isPomodoroRunning ? (
+                                    <button onClick={pausePomodoro} className="p-1 text-red-500 hover:bg-red-100 rounded-full transition" title="Tạm dừng">
+                                        <LucideIcon name="Pause" size={18} />
+                                    </button>
+                                ) : (
+                                    <button onClick={() => startPomodoro(task)} className="p-1 text-green-500 hover:bg-green-100 rounded-full transition" title="Bắt đầu">
+                                        <LucideIcon name="Play" size={18} fill="currentColor" />
+                                    </button>
+                                )}
+                                
+                                {isPomodoroActive && (
+                                    <button onClick={resetPomodoro} className="p-1 text-gray-500 hover:bg-gray-100 rounded-full transition" title="Thiết lập lại">
+                                        <LucideIcon name="RotateCcw" size={18} />
+                                    </button>
+                                )}
+                            </div>
+                        )}
+
+                        <div className="flex space-x-2 ml-auto mt-3 md:mt-0 shrink-0">
+                            {!task.isCompleted && (
+                                <button 
+                                    onClick={() => editTask(task)}
+                                    className="p-2 text-indigo-600 hover:bg-indigo-100 dark:hover:bg-indigo-700 rounded-full transition"
+                                    title="Chỉnh sửa"
+                                    disabled={isPomodoroActive}
+                                >
+                                    <LucideIcon name="Edit" size={18} />
+                                </button>
+                            )}
+                            <button 
+                                onClick={() => toggleTaskCompleted(task.id, task.isCompleted)}
+                                className={`p-2 rounded-full transition ${task.isCompleted ? 'text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600' : 'text-green-600 hover:bg-green-100 dark:hover:bg-green-700'}`}
+                                title={task.isCompleted ? "Chưa hoàn thành" : "Đã hoàn thành"}
+                                disabled={isPomodoroRunning}
+                            >
+                                <LucideIcon name="CheckCircle" size={18} fill={task.isCompleted ? 'currentColor' : 'none'} />
+                            </button>
+                            <button 
+                                onClick={() => deleteTask(task.id)}
+                                className="p-2 text-red-500 hover:bg-red-100 dark:hover:bg-red-700 rounded-full transition"
+                                title="Xóa"
+                                disabled={isPomodoroRunning}
+                            >
+                                <LucideIcon name="Trash2" size={18} />
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- GIAO DIỆN CHÍNH ---
+
+        if (!isAuthReady) {
+            return (
+                <div className="flex items-center justify-center h-screen bg-gray-50 dark:bg-gray-900 text-gray-700 dark:text-gray-300">
+                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500"></div>
+                    <p className="ml-4">Đang tải ứng dụng và xác thực người dùng...</p>
+                </div>
+            );
+        }
+
+        return (
+            <div className="flex flex-col h-screen bg-gray-100 dark:bg-gray-900 transition-colors duration-300">
+                
+                {/* Vùng Thông báo Pomodoro */}
+                <div id="notification-box" className="p-3 rounded-lg text-white font-bold fixed bottom-4 left-1/2 transform -translate-x-1/2 z-50 transition-opacity duration-300 opacity-0 pointer-events-none"></div>
+
+                {/* Header */}
+                <header className="sticky top-0 z-10 p-4 bg-white dark:bg-gray-800 shadow-lg">
+                    <div className="max-w-4xl mx-auto flex justify-between items-center">
+                        <h1 className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">
+                            Smart Study Flow
+                        </h1>
+                        <button 
+                            onClick={() => {
+                                if (taskInput.id) resetForm(); 
+                                setShowForm(!showForm);
+                            }}
+                            className={`p-3 rounded-full text-white transition duration-200 shadow-md flex items-center ${showForm ? 'bg-red-500 hover:bg-red-600 rotate-45' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+                            title="Thêm công việc"
+                        >
+                            <LucideIcon name="Plus" size={24} className="transition duration-200" />
+                        </button>
+                    </div>
+                </header>
+
+                {/* Form Thêm/Sửa Task */}
+                {showForm && (
+                    <div className="p-4 bg-indigo-50 dark:bg-gray-700 shadow-inner">
+                        <form onSubmit={handleFormSubmit} className="max-w-4xl mx-auto space-y-3">
+                            <h2 className="text-xl font-semibold text-gray-800 dark:text-white mb-3">{taskInput.id ? 'Sửa Công Việc' : 'Thêm Công Việc Mới'}</h2>
+                            <input
+                                type="text"
+                                placeholder="Tên công việc (ví dụ: Làm bài tập Lý chương 4)"
+                                value={taskInput.name}
+                                onChange={(e) => setTaskInput({...taskInput, name: e.target.value})}
+                                className="w-full p-3 border rounded-lg focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-600 dark:border-gray-500 dark:text-white"
+                                required
+                            />
+                            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                                <select
+                                    value={taskInput.priority}
+                                    onChange={(e) => setTaskInput({...taskInput, priority: e.target.value})}
+                                    className="p-3 border rounded-lg focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-600 dark:border-gray-500 dark:text-white"
+                                >
+                                    <option value="A">Ưu tiên A (Rất quan trọng)</option>
+                                    <option value="B">Ưu tiên B (Quan trọng)</option>
+                                    <option value="C">Ưu tiên C (Bình thường)</option>
+                                </select>
+                                <input
+                                    type="date"
+                                    value={taskInput.deadline}
+                                    onChange={(e) => setTaskInput({...taskInput, deadline: e.target.value})}
+                                    className="p-3 border rounded-lg focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-600 dark:border-gray-500 dark:text-white"
+                                    required
+                                />
+                                <select
+                                    value={taskInput.estimatedTime}
+                                    onChange={(e) => setTaskInput({...taskInput, estimatedTime: e.target.value})}
+                                    className="p-3 border rounded-lg focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-600 dark:border-gray-500 dark:text-white"
+                                >
+                                    <option value="30">30 phút</option>
+                                    <option value="60">1 giờ</option>
+                                    <option value="90">1.5 giờ</option>
+                                    <option value="120">2 giờ</option>
+                                    <option value="180">3 giờ</option>
+                                </select>
+                            </div>
+                            <button
+                                type="submit"
+                                className="w-full p-3 bg-indigo-600 text-white rounded-lg font-semibold hover:bg-indigo-700 transition duration-150 shadow-md"
+                            >
+                                {taskInput.id ? 'Cập Nhật Công Việc' : 'Thêm Công Việc'}
+                            </button>
+                        </form>
+                    </div>
+                )}
+
+                {/* Vùng Thống kê & Lọc */}
+                <div className="p-4 max-w-4xl mx-auto w-full">
+                    <div className="flex justify-between items-center bg-white dark:bg-gray-800 p-3 rounded-xl shadow-md border-l-4 border-teal-500">
+                        <div className="flex items-center text-teal-600 dark:text-teal-400">
+                            <LucideIcon name="CheckCircle" size={20} className="mr-2" />
+                            <span className="font-medium">Tổng thời gian hoàn thành:</span>
+                        </div>
+                        <span className="text-xl font-bold text-gray-900 dark:text-white">{formatTime(totalCompletedTime)}</span>
+                    </div>
+
+                    <div className="mt-4 flex space-x-2 text-sm">
+                        {['active', 'completed', 'all'].map(f => (
+                            <button
+                                key={f}
+                                onClick={() => setFilter(f)}
+                                className={`px-4 py-2 rounded-full font-medium transition ${
+                                    filter === f 
+                                        ? 'bg-indigo-600 text-white shadow-lg' 
+                                        : 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-600'
+                                }`}
+                            >
+                                {f === 'active' ? 'Việc Cần Làm' : f === 'completed' ? 'Đã Hoàn Thành' : 'Tất Cả'}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
+                {/* Vùng Danh Sách Công Việc */}
+                <main className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 max-w-4xl mx-auto w-full pb-20">
+                    {filteredAndSortedTasks.length > 0 ? (
+                        filteredAndSortedTasks.map(task => (
+                            <TaskCard key={task.id} task={task} />
+                        ))
+                    ) : (
+                        <div className="p-10 text-center text-gray-500 dark:text-gray-400 bg-white dark:bg-gray-800 rounded-xl shadow-md mt-6">
+                            <LucideIcon name="Calendar" size={32} className="mx-auto mb-3 text-indigo-400" />
+                            <p className="text-lg">Không có công việc nào trong danh sách này.</p>
+                            <p className="text-sm">Hãy nhấn nút <LucideIcon name="Plus" size={14} className="inline-block" /> để thêm công việc mới!</p>
+                        </div>
+                    )}
+                </main>
+                 <p className="text-center text-xs mt-2 text-gray-400 dark:text-gray-500 pb-4">
+                    UserID tạm thời: {userId} (Dữ liệu sẽ không bền vững nếu không có cấu hình Firebase)
+                </p>
+            </div>
+        );
+    };
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+</body>
+</html>
